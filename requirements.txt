@@ -1,0 +1,11 @@
+streamlit>=1.40
+pandas
+numpy
+plotly
+requests
+tzdata
+python-dateutil
+defusedxml
+yfinance
+openai
+numba
