@@ -797,13 +797,15 @@ def broker_close(client, tid):
 
 
 def send_telegram(token, chat_id, text):
+    """Zwraca (True/False, komunikat) — używane też przez przycisk testowy."""
     if not token or not chat_id:
-        return
+        return False, "Brak tokenu lub chat id (wpisz je w „Klucze API”)."
     try:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                      json={"chat_id": chat_id, "text": text}, timeout=5)
-    except Exception:
-        pass
+        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                          json={"chat_id": chat_id, "text": text}, timeout=5)
+        return (r.status_code == 200), ("Wysłano." if r.status_code == 200 else f"Telegram odpowiedział HTTP {r.status_code}.")
+    except Exception as exc:
+        return False, f"Błąd sieci: {type(exc).__name__}"
 
 
 def render_hidden_html(code):
@@ -818,7 +820,7 @@ def render_hidden_html(code):
 
 
 def trigger_beep_alarm(kind="LONG"):
-    f1, f2, f3 = {"EXIT": (1046, 1318, 1568), "LONG": (880, 1175, 880)}.get(kind, (520, 390, 520))
+    f1, f2, f3 = {"EXIT": (1046, 1318, 1568), "LONG": (880, 1175, 880), "LOSS": (330, 262, 196)}.get(kind, (520, 390, 520))
     render_hidden_html(f"""
     <script>(function(){{try{{const C=window.AudioContext||window.webkitAudioContext;const ctx=new C();
     if(ctx.resume){{ctx.resume();}}
@@ -1161,7 +1163,7 @@ def build_trades_table(df):
 
 
 def main():
-    st.set_page_config(page_title="SP500 SIGNAL AI PRO — v7.2", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="SP500 SIGNAL AI PRO — v7.2.1", page_icon="⚡", layout="wide")
     if TZ_ERROR:
         st.error("Brak bazy stref czasowych (typowe na Windows). Zainstaluj: `pip install tzdata` i uruchom ponownie. "
                  f"Szczegóły: {TZ_ERROR}")
@@ -1175,7 +1177,7 @@ def main():
 
     # ------------------------- PASEK BOCZNY -------------------------
     with st.sidebar:
-        st.title("⚡ SP500 Signal AI Pro v7.2")
+        st.title("⚡ SP500 Signal AI Pro v7.2.1")
         st.caption("Jeden silnik • TP1→break-even • limity ryzyka • backtest")
         with st.expander("🔑 Klucze API (tylko w pamięci sesji)", expanded=not bool(creds.get("cap_key"))):
             st.caption("Najlepiej ustaw je w zmiennych środowiskowych lub `.streamlit/secrets.toml` — wtedy nie trzeba ich wpisywać.")
@@ -1223,10 +1225,13 @@ def main():
         tg_on = st.toggle("📨 Alerty Telegram", value=bool(creds.get("tg_token")))
         if st.button("🔊 Test dźwięku", **stretch(st.button)):
             trigger_beep_alarm("LONG")
+        if st.button("📨 Test Telegram", **stretch(st.button)):
+            ok_tg, msg_tg = send_telegram(creds["tg_token"], creds["tg_chat"], "✅ Test alertu — SP500 Signal AI Pro")
+            (st.success if ok_tg else st.error)(msg_tg)
         auto_refresh = st.toggle("🔄 Auto-odświeżanie", value=True, key="auto_refresh")
         refresh_sec = st.slider("Co ile sekund:", 3, 30, 5)
 
-    st.title("🎯 SP500 SIGNAL AI PRO — v7.2")
+    st.title("🎯 SP500 SIGNAL AI PRO — v7.2.1")
     sched = markets_schedule()
     mc = st.columns(4)
     mc[0].info(f"**🇺🇸 US500 CFD:**\n\n{sched['cfd']}")
@@ -1325,7 +1330,7 @@ def body(creds, ui):
                 msgs.append(m) if m else None
         elif ev["type"] == "EXIT":
             msgs.append(f"{ev['status']} @ {ev['exit_price']:.2f}")
-            alarm = "EXIT" if ev["pnl"] > 0 else alarm
+            alarm = "EXIT" if ev["pnl"] > 0 else "LOSS"
             if auto_ok:
                 m = broker_close(client, ev["id"])
                 msgs.append(m) if m else None
