@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SP500 SIGNAL AI PRO — v7.2
+SP500 SIGNAL AI PRO — v7.3
 ===========================
 Poprawki względem v6 (wynik audytu):
   * JEDEN silnik pozycji (run_engine) — wykres, archiwum, backtest i auto-trading korzystają z tych samych transakcji.
@@ -404,6 +404,57 @@ def in_macro(ny_min, ny_wd):
     return any(a <= ny_min <= b for a, b in MACRO_WINDOWS)
 
 
+def evaluate_setup(B, j, sens, lp):
+    """Jedyna definicja warunków technicznych dla wykresu i silnika.
+
+    Zwracany wynik NIE jest prognozą prawdopodobieństwa ani sygnałem wykonania.
+    Filtry świeżości, spreadu i limitów ryzyka stosuje osobno silnik.
+    """
+    if j < 55 or j >= B["n"]:
+        return {"direction": 0, "reason": "Za mało zamkniętych świec do analizy.", "trend": "BRAK", "pattern": "-"}
+    O, H, L, C = B["o"], B["h"], B["l"], B["c"]
+    E9, E21, E50 = B["ema9"], B["ema21"], B["ema50"]
+    o, h, l, c = O[j], H[j], L[j], C[j]
+    po, pc = O[j-1], C[j-1]
+    e9, e21, e50 = E9[j], E21[j], E50[j]
+    atr = max(float(B["atr"][j]), 0.5)
+    rsi = float(B["rsi"][j])
+    body, rng = abs(c-o), max(h-l, 0.01)
+    upper, lower = h-max(o,c), min(o,c)-l
+    slope9, slope21 = e9-E9[j-3], e21-E21[j-3]
+    chop = abs(e9-e21) < atr*lp["min_atr_mult"] and abs(slope9) < atr*lp["min_slope_mult"]
+    near_high, near_low = (c-l)/rng >= 0.55, (h-c)/rng >= 0.55
+    wr = 1.4 if sens == SENS_HIGH else 1.7
+    bull = ((lower >= body*wr and lower >= rng*.4 and near_high and c > o)
+            or (pc < po and c > o and c > po and body >= atr*.35)
+            or (l <= e21 and c > e9 and c > o and near_high)
+            or (c > o and c > e9 and e9 > e21 and E9[j-2] <= E21[j-2]))
+    bear = ((upper >= body*wr and upper >= rng*.4 and near_low and c < o)
+            or (pc > po and c < o and c < po and body >= atr*.35)
+            or (h >= e21 and c < e9 and c < o and near_low)
+            or (c < o and c < e9 and e9 < e21 and E9[j-2] >= E21[j-2]))
+    up = bool(e9 > e21 and c > e50 and slope9 > 0 and slope21 >= 0)
+    dn = bool(e9 < e21 and c < e50 and slope9 < 0 and slope21 <= 0)
+    bias = int(B["htf"][j])
+    # STRICT wymaga POTWIERDZONEGO trendu HTF. Nie traktuj braku danych HTF jak zgody.
+    if sens == SENS_STRICT:
+        up, dn = up and bias == 1, dn and bias == -1
+    trend = "WZROSTOWY" if up else ("SPADKOWY" if dn else "NIEPOTWIERDZONY")
+    if chop and sens != SENS_HIGH:
+        return {"direction": 0, "reason": "Konsolidacja: EMA9 i EMA21 zbyt blisko, brak momentum.", "trend": trend, "pattern": "-", "rsi": rsi}
+    if bull and up and 42 <= rsi <= lp["rsi_long_max"]:
+        d, reason = 1, "Formacja popytowa + zgodny trend EMA + RSI."
+    elif bear and dn and lp["rsi_short_min"] <= rsi <= 58:
+        d, reason = -1, "Formacja podażowa + zgodny trend EMA + RSI."
+    elif (up and not bull) or (dn and not bear):
+        d, reason = 0, "Trend widoczny, ale brak potwierdzonej formacji wejścia."
+    elif sens == SENS_STRICT and bias == 0:
+        d, reason = 0, "Brak potwierdzenia na wyższym interwale (HTF)."
+    else:
+        d, reason = 0, "Warunki formacji, trendu lub RSI nie są zgodne."
+    return {"direction": d, "reason": reason, "trend": trend, "pattern": ("Popyt" if d == 1 else "Podaż" if d == -1 else "-"), "rsi": rsi, "atr": atr}
+
+
 # ==========================================================
 # SILNIK POZYCJI — JEDNO ŹRÓDŁO PRAWDY (live, archiwum, backtest)
 # ==========================================================
@@ -517,39 +568,14 @@ def run_engine(B, j_from, j_to, state, cfg, lp):
         if cfg["macro_block"] and in_macro(B["ny_min"][j + 1], B["ny_wd"][j + 1]):
             continue
 
-        po, pc = O[j - 1], C[j - 1]
-        ema9, ema21, ema50, rsi = E9[j], E21[j], E50[j], RSI[j]
-        atr = max(float(ATR[j]), 0.5)
-        body, rng = abs(c - o), max(h - l, 0.01)
-        upper, lower = h - max(o, c), min(o, c) - l
-        slope9, slope21 = ema9 - E9[j - 3], ema21 - E21[j - 3]
-        is_chop = (abs(ema9 - ema21) < atr * lp["min_atr_mult"]) and (abs(slope9) < atr * lp["min_slope_mult"])
-        if sens != SENS_HIGH and is_chop:
-            continue
-        near_high, near_low = ((c - l) / rng) >= 0.55, ((h - c) / rng) >= 0.55
-
-        bull = ((lower >= body * wick_ratio and lower >= rng * 0.40 and near_high and c > o) or
-                (pc < po and c > o and c > po and body >= atr * 0.35) or
-                (l <= ema21 and c > ema9 and c > o and near_high) or
-                (c > o and c > ema9 and ema9 > ema21 and E9[j - 2] <= E21[j - 2]))
-        bear = ((upper >= body * wick_ratio and upper >= rng * 0.40 and near_low and c < o) or
-                (pc > po and c < o and c < po and body >= atr * 0.35) or
-                (h >= ema21 and c < ema9 and c < o and near_low) or
-                (c < o and c < ema9 and ema9 < ema21 and E9[j - 2] >= E21[j - 2]))
-        trend_up = ema9 > ema21 and c > ema50 and slope9 > 0 and slope21 >= 0
-        trend_dn = ema9 < ema21 and c < ema50 and slope9 < 0 and slope21 <= 0
-        if sens == SENS_STRICT and HTF[j] != 0:
-            trend_up, trend_dn = trend_up and HTF[j] == 1, trend_dn and HTF[j] == -1
-
-        if bull and trend_up and 42 <= rsi <= lp["rsi_long_max"]:
-            d = 1
-        elif bear and trend_dn and lp["rsi_short_min"] <= rsi <= 58:
-            d = -1
-        else:
+        setup = evaluate_setup(B, j, sens, lp)
+        d = setup["direction"]
+        if d == 0:
             continue
         if cfg.get("news_veto") and cfg.get("news_bias", 0) == -d:
             continue
-
+        atr = max(float(ATR[j]), 0.5)
+        rsi = float(RSI[j])
         entry = round(O[j + 1] + d * hs, 2)           # LONG po ASK, SHORT po BID
         adv_ext = (entry - l) if d == 1 else (h - entry)
         if wave30:
@@ -633,7 +659,11 @@ class CapitalClient:
         if r is None:
             return pd.DataFrame(), None, err
         if r.status_code != 200:
-            return pd.DataFrame(), None, f"Błąd pobierania świec ({r.status_code})"
+            try:
+                err_code = str(r.json().get("errorCode", ""))[:100]
+            except Exception:
+                err_code = ""
+            return pd.DataFrame(), None, f"Błąd pobierania świec HTTP {r.status_code}" + (f" ({err_code})" if err_code else "")
         rows, spread = [], None
         for p in r.json().get("prices", []):
             try:
@@ -649,7 +679,7 @@ class CapitalClient:
             except (KeyError, TypeError):
                 continue
         if not rows:
-            return pd.DataFrame(), None, "Brak świec z Capital.com"
+            return pd.DataFrame(), None, f"Brak świec z Capital.com (EPIC={epic}, interwał={resolution})"
         df = pd.DataFrame(rows).set_index("Time").sort_index()
         df = df[~df.index.duplicated(keep="last")]
         return df, spread, "🟢 NA ŻYWO: Capital.com API"
@@ -797,30 +827,22 @@ def broker_close(client, tid):
 
 
 def send_telegram(token, chat_id, text):
-    """Zwraca (True/False, komunikat) — używane też przez przycisk testowy."""
     if not token or not chat_id:
-        return False, "Brak tokenu lub chat id (wpisz je w „Klucze API”)."
+        return
     try:
-        r = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
-                          json={"chat_id": chat_id, "text": text}, timeout=5)
-        return (r.status_code == 200), ("Wysłano." if r.status_code == 200 else f"Telegram odpowiedział HTTP {r.status_code}.")
-    except Exception as exc:
-        return False, f"Błąd sieci: {type(exc).__name__}"
+        requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                      json={"chat_id": chat_id, "text": text}, timeout=5)
+    except Exception:
+        pass
 
 
 def render_hidden_html(code):
     """st.components.v1.html jest wycofywany -> najpierw st.iframe (nowe wersje), potem stara metoda."""
-    if hasattr(st, "iframe"):
-        try:
-            st.iframe(code, width=1, height=1)
-            return
-        except Exception:
-            pass
     components.html(code, height=0, width=0)
 
 
 def trigger_beep_alarm(kind="LONG"):
-    f1, f2, f3 = {"EXIT": (1046, 1318, 1568), "LONG": (880, 1175, 880), "LOSS": (330, 262, 196)}.get(kind, (520, 390, 520))
+    f1, f2, f3 = {"EXIT": (1046, 1318, 1568), "LONG": (880, 1175, 880)}.get(kind, (520, 390, 520))
     render_hidden_html(f"""
     <script>(function(){{try{{const C=window.AudioContext||window.webkitAudioContext;const ctx=new C();
     if(ctx.resume){{ctx.resume();}}
@@ -1163,7 +1185,7 @@ def build_trades_table(df):
 
 
 def main():
-    st.set_page_config(page_title="SP500 SIGNAL AI PRO — v7.2.1", page_icon="⚡", layout="wide")
+    st.set_page_config(page_title="SP500 SIGNAL AI PRO — v7.3", page_icon="⚡", layout="wide")
     if TZ_ERROR:
         st.error("Brak bazy stref czasowych (typowe na Windows). Zainstaluj: `pip install tzdata` i uruchom ponownie. "
                  f"Szczegóły: {TZ_ERROR}")
@@ -1177,7 +1199,7 @@ def main():
 
     # ------------------------- PASEK BOCZNY -------------------------
     with st.sidebar:
-        st.title("⚡ SP500 Signal AI Pro v7.2.1")
+        st.title("⚡ SP500 Signal AI Pro v7.3")
         st.caption("Jeden silnik • TP1→break-even • limity ryzyka • backtest")
         with st.expander("🔑 Klucze API (tylko w pamięci sesji)", expanded=not bool(creds.get("cap_key"))):
             st.caption("Najlepiej ustaw je w zmiennych środowiskowych lub `.streamlit/secrets.toml` — wtedy nie trzeba ich wpisywać.")
@@ -1221,17 +1243,17 @@ def main():
         trade_size = st.number_input("Wielkość pozycji (kontrakty):", 0.1, 50.0, 1.0, 0.5)
 
         st.subheader("4. Alerty i odświeżanie")
+        st.caption("Wykres: oznaczenia LIVE z dziennika i osobne oznaczenia historyczne SIM (nie myl ich z realnym handlem).")
+        show_sim = st.toggle("📍 Historyczne strzałki SIM na wykresie", value=True,
+                             help="Wyłącznie symulacja na tych samych świecach; nie są to sygnały wydane w przeszłości.")
         sound_on = st.toggle("🔊 Dźwięk w przeglądarce", value=True)
         tg_on = st.toggle("📨 Alerty Telegram", value=bool(creds.get("tg_token")))
         if st.button("🔊 Test dźwięku", **stretch(st.button)):
             trigger_beep_alarm("LONG")
-        if st.button("📨 Test Telegram", **stretch(st.button)):
-            ok_tg, msg_tg = send_telegram(creds["tg_token"], creds["tg_chat"], "✅ Test alertu — SP500 Signal AI Pro")
-            (st.success if ok_tg else st.error)(msg_tg)
         auto_refresh = st.toggle("🔄 Auto-odświeżanie", value=True, key="auto_refresh")
         refresh_sec = st.slider("Co ile sekund:", 3, 30, 5)
 
-    st.title("🎯 SP500 SIGNAL AI PRO — v7.2.1")
+    st.title("🎯 SP500 SIGNAL AI PRO — v7.3")
     sched = markets_schedule()
     mc = st.columns(4)
     mc[0].info(f"**🇺🇸 US500 CFD:**\n\n{sched['cfd']}")
@@ -1285,8 +1307,8 @@ def body(creds, ui):
     now_utc = pd.Timestamp.now(tz="UTC")
     live_age = (now_utc - idx[-1]).total_seconds()
     max_delay = max(25.0, 0.3 * interval_min * 60)
-    fresh = live_age <= max_delay                       # wolno wejść: świeca otwarta przed chwilą
-    stale = live_age > interval_min * 60 + 30           # dane faktycznie stare / rynek zamknięty
+    fresh = 0 <= live_age <= max_delay                       # wolno wejść: świeca otwarta przed chwilą
+    stale = live_age < -10 or live_age > interval_min * 60 + 30           # dane faktycznie stare / rynek zamknięty
     spread_ok = spread <= ui["max_spread"]
 
     stream = f"{src}|{resolution}|{'W30' if wave30 else 'SCALP'}|{SENS_CODE[sensitivity]}"
@@ -1308,11 +1330,13 @@ def body(creds, ui):
     events = process_live(B, stream, src, cfg, lp)
 
     # ------------------------- ZDARZENIA: zlecenia, dźwięk, alerty -------------------------
-    auto_ok = bool(auto_ok_flag and creds["is_demo"] and src == "CAP")
+    auto_ok = bool(auto_ok_flag and creds["is_demo"] and src == "CAP" and fresh and spread_ok)
     if auto_ok_flag and not creds["is_demo"]:
         st.error("⛔ Auto-trading zablokowany: odznaczono konto DEMO. Ten program handluje automatycznie wyłącznie na DEMO.")
     elif auto_ok_flag and src != "CAP":
         st.warning("⛔ Auto-trading wstrzymany: dane pochodzą z trybu awaryjnego (nie z Capital.com).")
+    if auto_ok_flag and src == "CAP" and not fresh:
+        st.warning("⛔ Auto-trading DEMO wstrzymany: świece Capital.com nie są świeże (nie wykonujemy zaległych sygnałów).")
     alarm = None
     for ev in events:
         msgs = []
@@ -1330,7 +1354,7 @@ def body(creds, ui):
                 msgs.append(m) if m else None
         elif ev["type"] == "EXIT":
             msgs.append(f"{ev['status']} @ {ev['exit_price']:.2f}")
-            alarm = "EXIT" if ev["pnl"] > 0 else "LOSS"
+            alarm = "EXIT" if ev["pnl"] > 0 else alarm
             if auto_ok:
                 m = broker_close(client, ev["id"])
                 msgs.append(m) if m else None
@@ -1399,6 +1423,53 @@ def body(creds, ui):
 
     # ======================= TAB: WYKRES =======================
     with tab_main:
+        st.subheader("🚦 PANEL DECYZYJNY — WEJŚCIE / WYJŚCIE / WAIT")
+        st.caption("Silnik PAPER: wejście tylko po zamkniętej świecy, decyzje nie są gwarancją wyniku. LIVE i SIM są odseparowane.")
+        setup = evaluate_setup(B, n-2, sensitivity, lp)
+        decision_time = B["idx"][n-2].tz_convert(PL_TZ).strftime("%H:%M:%S")
+        # Nie nazywamy technicznego setupu wejściem, dopóki nie ma nowej zapisanej transakcji.
+        if not open_tr.empty:
+            r0 = open_tr.iloc[-1]
+            side = "LONG ▲" if int(r0["direction"]) == 1 else "SHORT ▼"
+            st.success(f"### 🟢 POZYCJA PAPER OTWARTA: {side}  |  {float(r0['entry']):.2f} pkt")
+            st.markdown(f"**SL {float(r0['sl']):.2f}**  ·  **TP1 {float(r0['tp1']):.2f}**  ·  **TP2 {float(r0['tp2']):.2f}**  ·  "
+                        f"**Stan:** {r0['status']}  ·  **Wejście:** {to_pl(r0['entry_time'], '%H:%M:%S')} PL")
+        elif src != "CAP":
+            st.error(f"### ⛔ WAIT — brak świec brokera Capital.com\n"
+                     f"Źródło zastępcze: {source_status}. Capital.com: {cap_msg}. "
+                     "Bez aktualnego US500 CFD nie ma sygnału do wykonania.")
+        elif not fresh or stale:
+            st.warning(f"### 🟡 WAIT — ceny nie są dostatecznie świeże (wiek najnowszej świecy: {live_age:.0f} s). "
+                       "Bot nie wskazuje wejścia na spóźnionych danych.")
+        elif not spread_ok:
+            st.warning(f"### 🟡 WAIT — zbyt wysoki spread {spread:.2f} pkt > limit {ui['max_spread']:.2f} pkt.")
+        elif blocks:
+            st.warning("### 🟡 WAIT — nowe wejścia zablokowane: " + " • ".join(blocks))
+        elif setup["direction"] == 0:
+            st.info(f"### ⚪ WAIT — {setup['reason']}  ·  trend: {setup['trend']}, RSI {setup.get('rsi', 0):.1f}")
+        elif ui["news_veto"] and news_bias == -setup["direction"]:
+            st.warning("### 🟡 WAIT — techniczny setup zablokowany przez weto wiadomości.")
+        else:
+            st.info(f"### 🔎 OBSERWUJ {'LONG ▲' if setup['direction']==1 else 'SHORT ▼'} — jest układ techniczny, "
+                    "ale to NIE jest nowe potwierdzone wejście. "
+                    "Wykonany sygnał pojawi się dopiero po zapisaniu transakcji PAPER w silniku.")
+        st.caption(f"Warunki zamkniętej świecy {decision_time} PL: {setup['reason']}  |  "
+                   "Historia oznaczona SIM służy wyłącznie do weryfikacji algorytmu, nie jest rzeczywistą historią alertów.")
+        if src == "CAP" and fresh and n >= 60:
+            # Podgląd świecy w budowie ma wyłącznie charakter wczesnego ostrzeżenia.
+            provisional = evaluate_setup(B, n-1, sensitivity, lp)
+            sec_to_close = max(0, int(interval_min * 60 - (now_utc - idx[-1]).total_seconds()))
+            provisional_side = ("LONG ▲" if provisional['direction'] == 1 else
+                                "SHORT ▼" if provisional['direction'] == -1 else "BRAK")
+            st.caption(f"⏱️ Kolejna zamknięta świeca za ok. {sec_to_close} s. "
+                       f"PODGLĄD NIEZAMKNIĘTEJ świecy: {provisional_side} — {provisional['reason']} "
+                       "(może się zmienić; nie otwieramy pozycji na tym podglądzie).")
+        if not closed_stream.empty:
+            last_done = closed_stream.iloc[-1]
+            st.caption(f"📌 Ostatnie rzeczywiste WYJŚCIE z dziennika PAPER: "
+                       f"{'LONG' if int(last_done['direction']) == 1 else 'SHORT'} · "
+                       f"{last_done['status']} · {to_pl(last_done['exit_time'], '%H:%M:%S')} PL")
+        st.markdown("---")
         hs = spread / 2.0
         if not open_tr.empty:
             r = open_tr.iloc[-1]
@@ -1429,7 +1500,7 @@ def body(creds, ui):
         c[4].metric("Oczekiwana wartość", f"{st_stream['expectancy']:+.2f} pkt", delta=f"suma {st_stream['total']:+.1f}")
         c[5].metric("Dziś (PL)", f"{today_pnl:+.1f} pkt", delta=f"{n_today}/{cfg['max_trades_day']} transakcji", delta_color="off")
 
-        dfp = B["df"].tail(95).copy()
+        dfp = B["df"].tail(180).copy()
         dfp.index = dfp.index.tz_convert(PL_TZ).tz_localize(None)
         fig = go.Figure()
         fig.add_trace(go.Candlestick(x=dfp.index, open=dfp["Open"], high=dfp["High"], low=dfp["Low"], close=dfp["Close"],
@@ -1438,7 +1509,7 @@ def body(creds, ui):
         fig.add_trace(go.Scatter(x=dfp.index, y=dfp["EMA21"], line=dict(color="#2979ff", width=1.6), name="EMA 21"))
         fig.add_trace(go.Scatter(x=dfp.index, y=dfp["EMA50"], line=dict(color="#ab47bc", width=1.2, dash="dot"), name="EMA 50"))
         if not all_tr.empty:
-            win_start = B["idx"][-95] if n >= 95 else B["idx"][0]
+            win_start = B["idx"][-180] if n >= 180 else B["idx"][0]
             vis = all_tr[pd.to_datetime(all_tr["signal_time"], utc=True) >= win_start].copy()
             if not vis.empty:
                 vis["x"] = pd.to_datetime(vis["signal_time"], utc=True).dt.tz_convert(PL_TZ).dt.tz_localize(None)
@@ -1457,6 +1528,31 @@ def body(creds, ui):
                                              textposition="bottom center", name="Zamknięcia",
                                              marker=dict(symbol="diamond", size=13, color=["#ffd600" if p > 0 else "#ff5252" for p in ex_df["pnl"]],
                                                          line=dict(color="black", width=1))))
+        if ui["show_sim"]:
+            # Ważne: to retrospekcyjny BACKTEST, nie udajemy historycznych alertów.
+            try:
+                hist_tr, _ = run_backtest(B["df"], resolution, dict(cfg, halt=False, session_on=False), dict(DEFAULT_LP))
+                if not hist_tr.empty:
+                    hwin = B["idx"][-180] if n >= 180 else B["idx"][0]
+                    sim = hist_tr[pd.to_datetime(hist_tr["signal_time"], utc=True) >= hwin].copy()
+                    for direction, glyph, clr, sym in ((1, "SIM LONG ▲", "#4ddbff", "triangle-up"),
+                                                        (-1, "SIM SHORT ▼", "#ffad42", "triangle-down")):
+                        ss = sim[sim["direction"] == direction]
+                        if not ss.empty:
+                            xs = pd.to_datetime(ss["entry_time"], utc=True).dt.tz_convert(PL_TZ).dt.tz_localize(None)
+                            fig.add_trace(go.Scatter(x=xs, y=ss["entry"], mode="markers+text",
+                                                     text=[glyph] * len(ss), textposition="bottom center" if direction == 1 else "top center",
+                                                     name=glyph, marker=dict(symbol=sym, size=13, color=clr),
+                                                     hovertemplate="Symulacja historyczna: %{x}<br>Cena: %{y:.2f}<extra></extra>"))
+                    ss = sim[(sim["state"] == "CLOSED") & sim["exit_time"].notna()].copy()
+                    if not ss.empty:
+                        xs = pd.to_datetime(ss["exit_time"], utc=True).dt.tz_convert(PL_TZ).dt.tz_localize(None)
+                        fig.add_trace(go.Scatter(x=xs, y=ss["exit_price"], mode="markers+text",
+                                                 text=[f"SIM WYJŚCIE {v:+.1f} pkt" for v in ss["pnl"]],
+                                                 textposition="top center", name="SIM WYJŚCIA",
+                                                 marker=dict(symbol="diamond", size=11, color="#dddddd")))
+            except Exception as sim_exc:
+                st.caption(f"Nie można wyświetlić symulacji historycznej: {type(sim_exc).__name__}")
         if not open_tr.empty:
             r = open_tr.iloc[-1]
             for y, col, dash, name in [(r["entry"], "#ffffff", "dash", "Wejście"), (r["sl"], "#ff1744", "dot", "SL"),
@@ -1670,6 +1766,9 @@ def body(creds, ui):
             st.caption(f"📄 {art['description']}")
 
     with st.expander("🛠️ Diagnostyka (przydatna przy problemach na Streamlit Cloud)"):
+        st.markdown("**Lista kontrolna:** wpisane wszystkie 3 dane Capital.com DEMO; API Key aktywne; EPIC US500 dostępny "
+                    "na tym koncie; najnowsza świeca nie jest opóźniona; spread nie przekracza limitu. "
+                    "Jeżeli widzisz błędy HTTP 401/403, sprawdź API Key/login/hasło API; przy 404 sprawdź EPIC.")
         try:
             db_ok = os.access(os.path.dirname(os.path.abspath(DB_FILE)) or ".", os.W_OK)
             counts = db_query("SELECT stream, state, COUNT(*) AS n FROM trades GROUP BY stream, state")
